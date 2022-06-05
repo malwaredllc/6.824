@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"encoding/json"
 	"sort"
+	"regexp"
 )
 
 //
@@ -44,76 +45,101 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	for {
 		task := GetTaskFromCoordinator()
-		switch task.Type {
-		case Map:
-			// get key-value pairs
+		if task.Type != Map {
+			log.Printf("done")
+			break
+		}
+
+		// MAP
+		intermediate := []KeyValue{}
+		file, err := os.Open(task.Target)
+		if err != nil {
+			log.Fatalf("cannot open %v", task.Target)
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", task.Target)
+		}
+		file.Close()
+		kva := mapf(task.Target, string(content))
+		intermediate = append(intermediate, kva...)
+
+		// write to nReduce JSON files
+		files := make([]*json.Encoder, task.RedNum)
+		for i := 0; i < task.RedNum; i++ {
+			path := fmt.Sprintf("mr-tmp/mr-%d-%d.json", task.JobNum, i)
+			f, err := os.Create(path)
+			if err != nil {
+				log.Fatalf("error creating %v", path)
+			}
+			enc := json.NewEncoder(f)
+			files[i] = enc
+			defer f.Close()
+		}
+		for _, kv := range intermediate {
+			idx := ihash(kv.Key) % task.RedNum
+			enc := files[idx]
+			err := enc.Encode(&kv)
+			if err != nil {
+				log.Printf("failed to encode %v", kv)
+			}
+		}	
+
+		// REDUCE
+		mapFiles, err := ioutil.ReadDir("mr-tmp")
+		if err != nil {
+			log.Fatalf("failed to read dir mr-tmp")
+		}
+
+		// find each map file for this reduce task ("mr-[job]-[task].json")
+		for i := 0; i < task.RedNum; i++ {
 			intermediate := []KeyValue{}
-			file, err := os.Open(task.Target)
-			if err != nil {
-				log.Fatalf("cannot open %v", task.Target)
-			}
-			content, err := ioutil.ReadAll(file)
-			if err != nil {
-				log.Fatalf("cannot read %v", task.Target)
-			}
-			file.Close()
-			kva := mapf(task.Target, string(content))
-			intermediate = append(intermediate, kva...)
-
-			sort.Sort(ByKey(intermediate))
-
-			// write to nReduce JSON files
-			for redNum := 0; redNum < task.RedNum; redNum++ {
-				mapFile := fmt.Sprintf("mr-tmp/mr-%d-%d.json", task.JobNum, redNum)
-				f, err := os.Create(mapFile)
-				if err != nil {
-					log.Fatalf("cannot create %v", mapFile)
-				}
-				defer f.Close()
-
-				enc := json.NewEncoder(f)
-				for _, kv := range intermediate {
-					err := enc.Encode(&kv)
+			pattern := fmt.Sprintf("-%d.json", i)
+			for _, mapFile := range mapFiles {
+				matched, _ := regexp.MatchString(pattern, mapFile.Name())
+				if matched {
+					file, err = os.Open(fmt.Sprintf("mr-tmp/%s", mapFile.Name()))
 					if err != nil {
-						log.Printf("error encoding to json: %v", err)
+						log.Fatalf("couldn't open %s", mapFile.Name())
+					}
+					dec := json.NewDecoder(file)
+					for {
+						var kv KeyValue
+						if err := dec.Decode(&kv); err != nil {
+							break
+						}
+						intermediate = append(intermediate, kv)
 					}
 				}
-				log.Printf("created %s", mapFile)
 			}
-			break
 
-		case Reduce:
-			log.Printf("reduce task received: %s", task.Target)
+			// sort keys
+			sort.Sort(ByKey(intermediate))
 
-			oname := "mr-out-0"
+			// create output file
+			oname := fmt.Sprintf("mr-tmp/mr-out-%d", i)
 			ofile, _ := os.Create(oname)
 		
-			//
 			// call Reduce on each distinct key in intermediate[],
-			// and print the result to mr-out-0.
-			//
-			i := 0
-			for i < len(intermediate) {
-				j := i + 1
-				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			// and print the result to mr-out-[task]
+			idx := 0
+			for idx < len(intermediate) {
+				j := idx + 1
+				for j < len(intermediate) && intermediate[j].Key == intermediate[idx].Key {
 					j++
 				}
 				values := []string{}
-				for k := i; k < j; k++ {
+				for k := idx; k < j; k++ {
 					values = append(values, intermediate[k].Value)
 				}
-				output := reducef(intermediate[i].Key, values)
+				output := reducef(intermediate[idx].Key, values)
 		
 				// this is the correct format for each line of Reduce output.
-				fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+				fmt.Fprintf(ofile, "%v %v\n", intermediate[idx].Key, output)
 		
-				i = j
+				idx = j
 			}
-		
 			ofile.Close()
-			break
-		default:
-			log.Printf("invalid task type: %d, %s", task.Type, task.Target)
 		}
 	}
 }
@@ -128,14 +154,7 @@ func GetTaskFromCoordinator() *TaskResponse {
 	// send the RPC request, wait for the reply.
 	ok := call("Coordinator.GetTask", &args, &reply)
 	if ok {
-		// reply.Y should be 100.
-		var t string
-		if reply.Type == Map {
-			t = "Map"
-		} else {
-			t = "Reduce"
-		}
-		log.Printf("got task: %s %d %s\n", t, reply.Type, reply.Target)
+		log.Printf("Target: %s, nReduce: %d,  JobNum: %d", reply.Target, reply.RedNum, reply.JobNum)
 		return &reply
 	} else {
 		log.Printf("call failed!\n")
