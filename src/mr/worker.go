@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"encoding/json"
 	"sort"
+	"time"
 	"regexp"
 )
 
@@ -44,107 +45,125 @@ func ihash(key string) int {
 //
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	for {
-		task := GetTaskFromCoordinator()
-		if task.Type != Map {
-			log.Printf("done")
-			break
+		task := getTaskFromCoordinator()
+		if task == nil {
+			log.Printf("task was nil, exiting")
+			os.Exit(0)
 		}
 
-		// MAP
-		intermediate := []KeyValue{}
-		file, err := os.Open(task.Target)
-		if err != nil {
-			log.Fatalf("cannot open %v", task.Target)
-		}
-		content, err := ioutil.ReadAll(file)
-		if err != nil {
-			log.Fatalf("cannot read %v", task.Target)
-		}
-		file.Close()
-		kva := mapf(task.Target, string(content))
-		intermediate = append(intermediate, kva...)
-
-		// write to nReduce JSON files
-		files := make([]*json.Encoder, task.RedNum)
-		for i := 0; i < task.RedNum; i++ {
-			path := fmt.Sprintf("mr-tmp/mr-%d-%d.json", task.JobNum, i)
-			f, err := os.Create(path)
-			if err != nil {
-				log.Fatalf("error creating %v", path)
-			}
-			enc := json.NewEncoder(f)
-			files[i] = enc
-			defer f.Close()
-		}
-		for _, kv := range intermediate {
-			idx := ihash(kv.Key) % task.RedNum
-			enc := files[idx]
-			err := enc.Encode(&kv)
-			if err != nil {
-				log.Printf("failed to encode %v", kv)
-			}
-		}	
-
-		// REDUCE
-		mapFiles, err := ioutil.ReadDir("mr-tmp")
-		if err != nil {
-			log.Fatalf("failed to read dir mr-tmp")
-		}
-
-		// find each map file for this reduce task ("mr-[job]-[task].json")
-		for i := 0; i < task.RedNum; i++ {
+		switch task.Type {
+		case Map:
+			// MAP
 			intermediate := []KeyValue{}
-			pattern := fmt.Sprintf("-%d.json", i)
-			for _, mapFile := range mapFiles {
-				matched, _ := regexp.MatchString(pattern, mapFile.Name())
-				if matched {
-					file, err = os.Open(fmt.Sprintf("mr-tmp/%s", mapFile.Name()))
-					if err != nil {
-						log.Fatalf("couldn't open %s", mapFile.Name())
-					}
-					dec := json.NewDecoder(file)
-					for {
-						var kv KeyValue
-						if err := dec.Decode(&kv); err != nil {
-							break
+			file, err := os.Open(task.Target)
+			if err != nil {
+				log.Fatalf("cannot open %v", task.Target)
+			}
+			content, err := ioutil.ReadAll(file)
+			if err != nil {
+				log.Fatalf("cannot read %v", task.Target)
+			}
+			file.Close()
+			kva := mapf(task.Target, string(content))
+			intermediate = append(intermediate, kva...)
+
+			// write to nReduce JSON files
+			files := make([]*json.Encoder, task.NReduce)
+			for i := 0; i < task.NReduce; i++ {
+				path := fmt.Sprintf("mr-%d-%d.json", task.Num, i)
+				f, err := os.Create(path)
+				if err != nil {
+					log.Fatalf("error creating %v", path)
+				}
+				enc := json.NewEncoder(f)
+				files[i] = enc
+				defer f.Close()
+			}
+			for _, kv := range intermediate {
+				idx := ihash(kv.Key) % task.NReduce
+				enc := files[idx]
+				err := enc.Encode(&kv)
+				if err != nil {
+					log.Printf("failed to encode %v", kv)
+				}
+			}
+
+			// notify coordinator task is done
+			sendTaskDone(task.Id, task.Type)
+		case Reduce:
+			// REDUCE
+			mapFiles, err := ioutil.ReadDir(".")
+			if err != nil {
+				log.Fatalf("failed to read dir mr-tmp")
+			}
+
+			// find each map file for this reduce task ("mr-[job]-[task].json")
+			for i := 0; i < task.NReduce; i++ {
+				intermediate := []KeyValue{}
+				pattern := fmt.Sprintf("-%d.json", i)
+				for _, mapFile := range mapFiles {
+					matched, _ := regexp.MatchString(pattern, mapFile.Name())
+					if matched {
+						file, err := os.Open(fmt.Sprintf("%s", mapFile.Name()))
+						if err != nil {
+							log.Fatalf("couldn't open %s", mapFile.Name())
 						}
-						intermediate = append(intermediate, kv)
+						dec := json.NewDecoder(file)
+						for {
+							var kv KeyValue
+							if err := dec.Decode(&kv); err != nil {
+								break
+							}
+							intermediate = append(intermediate, kv)
+						}
 					}
 				}
+
+				// sort keys
+				sort.Sort(ByKey(intermediate))
+
+				// create output file
+				oname := fmt.Sprintf("mr-out-%d", i)
+				ofile, _ := os.Create(oname)
+			
+				// call Reduce on each distinct key in intermediate[],
+				// and print the result to mr-out-[task]
+				idx := 0
+				for idx < len(intermediate) {
+					j := idx + 1
+					for j < len(intermediate) && intermediate[j].Key == intermediate[idx].Key {
+						j++
+					}
+					values := []string{}
+					for k := idx; k < j; k++ {
+						values = append(values, intermediate[k].Value)
+					}
+					output := reducef(intermediate[idx].Key, values)
+			
+					// this is the correct format for each line of Reduce output.
+					fmt.Fprintf(ofile, "%v %v\n", intermediate[idx].Key, output)
+			
+					idx = j
+				}
+				ofile.Close()
 			}
 
-			// sort keys
-			sort.Sort(ByKey(intermediate))
-
-			// create output file
-			oname := fmt.Sprintf("mr-tmp/mr-out-%d", i)
-			ofile, _ := os.Create(oname)
-		
-			// call Reduce on each distinct key in intermediate[],
-			// and print the result to mr-out-[task]
-			idx := 0
-			for idx < len(intermediate) {
-				j := idx + 1
-				for j < len(intermediate) && intermediate[j].Key == intermediate[idx].Key {
-					j++
-				}
-				values := []string{}
-				for k := idx; k < j; k++ {
-					values = append(values, intermediate[k].Value)
-				}
-				output := reducef(intermediate[idx].Key, values)
-		
-				// this is the correct format for each line of Reduce output.
-				fmt.Fprintf(ofile, "%v %v\n", intermediate[idx].Key, output)
-		
-				idx = j
-			}
-			ofile.Close()
+			// notify coordinator task is done
+			sendTaskDone(task.Id, task.Type)
+		case Retry:
+			log.Printf("Retrying momentarily...")
+			time.Sleep(RetryInterval)
+		case Exit:
+			log.Printf("Exiting")
+			os.Exit(0)
+		default:
+			log.Printf("Invalid task type received: %s", task.Type)
+			os.Exit(0)
 		}
 	}
 }
 
-func GetTaskFromCoordinator() *TaskResponse {
+func getTaskFromCoordinator() *TaskResponse {
 	// declare args structure
 	args := TaskArgs{}
 
@@ -154,7 +173,8 @@ func GetTaskFromCoordinator() *TaskResponse {
 	// send the RPC request, wait for the reply.
 	ok := call("Coordinator.GetTask", &args, &reply)
 	if ok {
-		log.Printf("Target: %s, nReduce: %d,  JobNum: %d", reply.Target, reply.RedNum, reply.JobNum)
+		log.Printf("Id: %d, Type: %s, Target: %s, nReduce: %d, Num: %d", 
+			reply.Id, reply.Type, reply.Target, reply.NReduce, reply.Num)
 		return &reply
 	} else {
 		log.Printf("call failed!\n")
@@ -162,14 +182,15 @@ func GetTaskFromCoordinator() *TaskResponse {
 	return nil
 }
 
-func SendMapDone(filename string) error {
-	args := DoneArgs{Target: filename}
+// notify coordinator task is done
+func sendTaskDone(taskId int, taskType TaskType) error {
+	args := DoneArgs{Id: taskId, Type: taskType}
 	reply := DoneResponse{}
-	ok := call("Coordinator.MapDone", &args, &reply)
+	ok := call("Coordinator.TaskDone", &args, &reply)
 	if ok {
 		return nil
 	}
-	return errors.New(fmt.Sprintf("failed to send map done for %s", filename))
+	return errors.New(fmt.Sprintf("failed to send map done for %d %s", taskId, taskType))
 }
 
 //

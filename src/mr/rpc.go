@@ -6,27 +6,37 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+	"time"
+)
 
-type TaskType int
+type TaskType string
 
 const (
-	Map = 1
-	Reduce = 2
+	Map = "Map"
+	Reduce = "Reduce"
+	Retry = "Retry"
+	Exit = "Exit"
+	TaskTimeout = 15 * time.Second
+	RetryInterval = 3 * time.Second
 )
 
 type TaskArgs struct {}
 
 type TaskResponse struct {
+	Id			int
 	Type 		TaskType	
-	JobNum		int
-	RedNum		int
-	Target 		string
+	Num			int
+	NReduce		int
+	Target		string
+	done		bool
 }
 
 type DoneArgs struct {
-	Target 	string
+	Id		int
+	Type	TaskType
 }
 
 type DoneResponse struct {}
