@@ -9,19 +9,9 @@ package mr
 import (
 	"os"
 	"strconv"
-	"time"
 )
 
 type TaskType string
-
-const (
-	Map = "Map"
-	Reduce = "Reduce"
-	Retry = "Retry"
-	Exit = "Exit"
-	TaskTimeout = 15 * time.Second
-	RetryInterval = 3 * time.Second
-)
 
 type TaskArgs struct {}
 

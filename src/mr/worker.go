@@ -14,9 +14,7 @@ import (
 	"regexp"
 )
 
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
@@ -29,10 +27,8 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-//
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
@@ -40,20 +36,13 @@ func ihash(key string) int {
 }
 
 
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	for {
 		task := getTaskFromCoordinator()
-		if task == nil {
-			log.Printf("task was nil, exiting")
-			os.Exit(0)
-		}
 
 		switch task.Type {
 		case Map:
-			// MAP
 			intermediate := []KeyValue{}
 			file, err := os.Open(task.Target)
 			if err != nil {
@@ -70,7 +59,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			// write to nReduce JSON files
 			files := make([]*json.Encoder, task.NReduce)
 			for i := 0; i < task.NReduce; i++ {
-				path := fmt.Sprintf("mr-%d-%d.json", task.Num, i)
+				path := fmt.Sprintf("%s/mr-%d-%d.json", TempDir, task.Num, i)
 				f, err := os.Create(path)
 				if err != nil {
 					log.Fatalf("error creating %v", path)
@@ -90,8 +79,8 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 			// notify coordinator task is done
 			sendTaskDone(task.Id, task.Type)
+
 		case Reduce:
-			// REDUCE
 			mapFiles, err := ioutil.ReadDir(".")
 			if err != nil {
 				log.Fatalf("failed to read dir mr-tmp")
@@ -123,7 +112,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				sort.Sort(ByKey(intermediate))
 
 				// create output file
-				oname := fmt.Sprintf("mr-out-%d", i)
+				oname := fmt.Sprintf("%s/mr-out-%d", TempDir, i)
 				ofile, _ := os.Create(oname)
 			
 				// call Reduce on each distinct key in intermediate[],
@@ -150,6 +139,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 			// notify coordinator task is done
 			sendTaskDone(task.Id, task.Type)
+
 		case Retry:
 			log.Printf("Retrying momentarily...")
 			time.Sleep(RetryInterval)
@@ -158,7 +148,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			os.Exit(0)
 		default:
 			log.Printf("Invalid task type received: %s", task.Type)
-			os.Exit(0)
+			os.Exit(1)
 		}
 	}
 }
@@ -177,7 +167,8 @@ func getTaskFromCoordinator() *TaskResponse {
 			reply.Id, reply.Type, reply.Target, reply.NReduce, reply.Num)
 		return &reply
 	} else {
-		log.Printf("call failed!\n")
+		log.Printf("call failed - coordinator is down. exiting\n")
+		os.Exit(0)
 	}
 	return nil
 }
@@ -190,7 +181,7 @@ func sendTaskDone(taskId int, taskType TaskType) error {
 	if ok {
 		return nil
 	}
-	return errors.New(fmt.Sprintf("failed to send map done for %d %s", taskId, taskType))
+	return errors.New(fmt.Sprintf("failed to send task done for %d %s", taskId, taskType))
 }
 
 //
