@@ -10,59 +10,95 @@ import (
 	"time"
 )
 
+type TaskType int
+type TaskStatus int
+
+// task types
 const (
-	TempDir = "."
-	Map = "Map"
-	Reduce = "Reduce"
-	Retry = "Retry"
-	Exit = "Exit"
-	TaskTimeout = 15 * time.Second
-	RetryInterval = 3 * time.Second
+	Map TaskType = iota
+	Reduce 
+	Retry
+	Exit
 )
 
+// task statuses
+const (
+	Idle TaskStatus = iota
+	InProgress
+	Completed
+)
+
+// other consts
+const (
+	TempDir = "."
+	TaskTimeout = 15 * time.Second
+	RetryInterval = 3 * time.Second
+	NoWorkerAssigned = -1
+)
+type Task struct {
+	Index	 	int
+	WorkerId	int
+	File		string
+	Type		TaskType
+	Status		TaskStatus
+}
 
 type Coordinator struct {
-	mapCh			chan string
-	redCh			chan int
-	mapTasks		map[int]*TaskResponse
-	reduceTasks		map[int]*TaskResponse
-	numFiles		int
-	nReduce			int	
-	mapNum			int
-	taskId			int
+	mapTasks		[]*Task
+	reduceTasks		[]*Task	
 	mapRemaining 	int
 	reduceRemaining int
+	nReduce			int	
 	mu				sync.RWMutex
 }
 
 func (c *Coordinator) GetTask(args *TaskArgs, res *TaskResponse) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	workerId := args.WorkerId
 
-	if len(c.mapCh) > 0 {
-		c.assignMapTask(res)
-	} else if len(c.redCh) > 0 {
-		c.assignReduceTask(res)
+	// get next task
+	var task *Task
+	if c.mapRemaining > 0 {
+		task = c.assignMapTask(workerId)
+	} else if c.reduceRemaining > 0 {
+		task = c.assignReduceTask(workerId)
 	} else {
-		c.assignExitTask(res)
+		task = c.assignExitTask(workerId)
 	}
+
+	// update response object with task info
+	res.Index = task.Index
+	res.Type = task.Type
+	res.File = task.File
+	res.NReduce = c.nReduce
+
+	// monitor task for completion and re-execute if necessary
+	go c.monitorTaskProgress(task)
 	return nil
 }
 
-// RPC handler for worker to report map task is done
+// RPC handler for worker to report map task is done.
+// We update the worker ID of the task to whichever worker ID first reported it done.
+// This is because it is possible the task has been re-assigned due to timeout (taking
+// too long to finish), so we want to know which machine the completed output file is on.
+// In this local example it isn't useful since the worker ID is just the worker PID, but
+// when ran in a cluster it would be used to know which machine the output file is on.
 func (c *Coordinator) TaskDone(args *DoneArgs, res *DoneResponse) error {
-	log.Printf("Task %d %s done", args.Id, args.Type)
-	if args.Type == Map {
-		c.mu.Lock()
-		c.mapTasks[args.Id].done = true
-		c.mapRemaining--
-		c.mu.Unlock()
-	} else {
-		c.mu.Lock()
-		c.reduceTasks[args.Id].done = true
-		c.reduceRemaining--
-		c.mu.Unlock()
+	i := args.Index
+	workerId := args.WorkerId
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if args.Type == Map && c.mapTasks[i].Status != Completed {
+			c.mapTasks[i].Status = Completed
+			c.mapTasks[i].WorkerId = workerId
+			c.mapRemaining--
+	} else if args.Type == Reduce && c.reduceTasks[i].Status != Completed {
+			c.reduceTasks[i].Status = Completed
+			c.reduceTasks[i].WorkerId = workerId
+			c.reduceRemaining--
 	}
+
 	return nil
 }
 
@@ -94,104 +130,92 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	n := len(files)
 	c := Coordinator{}
-	c.mapCh = make(chan string, n)
-	c.redCh = make(chan int, nReduce)
-	c.mapTasks = make(map[int]*TaskResponse)
-	c.reduceTasks = make(map[int]*TaskResponse)
+	c.mapTasks = make([]*Task, n)
+	c.reduceTasks = make([]*Task, nReduce)
 	c.mapRemaining = n
 	c.reduceRemaining = nReduce
-	c.numFiles = n
 	c.nReduce = nReduce
-	c.mapNum = 0
-	c.taskId = 0
 
-	// create thread safe queue of map tasks (files to process)
-	for _, file := range files {
-		c.mapCh <- file
+	// create list of ready unassigned map tasks
+	for i, file := range files {
+		c.mapTasks[i] = &Task{
+			Index:		i,
+			WorkerId:	NoWorkerAssigned,
+			File:		file,
+			Type:		Map,
+			Status:		Idle,
+		}
 	}
 
-	// create thread safe queue for reduce tasks
+	// create list of ready unassigned reduce tasks
 	for i := 0; i < nReduce; i++ {
-		c.redCh <- i
+		c.reduceTasks[i] = &Task{
+			Index:		i,
+			WorkerId:	NoWorkerAssigned,
+			File:		"",
+			Type:		Reduce,
+			Status:		Idle,
+		}
 	} 
 
-	log.Printf("created coordinator")
+	//log.Printf("created coordinator")
 	c.server()
 	return &c
 }
 
-func (c *Coordinator) assignMapTask(res *TaskResponse) error {
-	// update task response with values for next map task
-	filename := <-c.mapCh
-	res.Id = c.taskId
-	res.Type = Map
-	res.Target = filename
-	res.Num = c.mapNum
-	res.NReduce = c.nReduce
-	res.done = false
+// Assigns next idle map task and spins off a thread to monitor it's progress
+func (c *Coordinator) assignMapTask(workerId int) *Task {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// increment counters and update task map
-	c.mapTasks[res.Id] = res
-	c.taskId++
-	c.mapNum++
-
-	// if task not done in 10 seconds, re-enqueue it
-	go func(taskId int) {
-		time.Sleep(TaskTimeout)
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		if !c.mapTasks[taskId].done {
-			log.Printf("re-enqueueing task %s %d", res.Type, res.Num)
-			c.mapCh <- res.Target // this is the file to map
-		} else {
-			log.Printf("task %s %d confirmed done", res.Type, res.Num)
-		} 
-	}(res.Id)
-
-	return nil
-}
-
-func (c *Coordinator) assignReduceTask(res *TaskResponse) error {
-	// if some map tasks are still processing, tell worker to retry later
-	if c.mapRemaining > 0 {
-		log.Printf("Not all map tasks done, can't assigning reduce task yet...")
-		res.Id = c.taskId
-		res.Type = Retry
-		c.taskId++
-		return nil
-	}
-
-	// otherwise assign a reduce task
-	redNum := <-c.redCh
-	res.Id = c.taskId
-	res.Type = Reduce
-	res.Target = "" 	// no target for reduce task
-	res.Num = redNum
-	res.NReduce = c.nReduce
-
-	// increment counter and store reduce task
-	c.taskId++
-	c.reduceTasks[res.Id] = res
-
-	// if task not done in 10 seconds, re-enqueue it
-	go func(taskId int) {
-		time.Sleep(TaskTimeout)
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		if !c.reduceTasks[taskId].done {
-			log.Printf("re-enqueueing task %s %d", res.Type, res.Num)
-			c.redCh <- res.Num // this is the reduce task number
-		} else {
-			log.Printf("task %s %d confirmed done", res.Type, res.Num)
+	var task *Task
+	for i := 0; i < len(c.mapTasks); i++ {
+		if c.mapTasks[i].Status == Idle {
+			task = c.mapTasks[i]
+			task.Index = i
+			task.Status = InProgress
+			task.WorkerId = workerId
+			return task
 		}
-	}(res.Id)
-	
-	return nil
+	}
+	return &Task{Type: Retry, Index: -1, Status: Completed, WorkerId: workerId}
 }
 
-func (c *Coordinator) assignExitTask(res *TaskResponse) error {
-	res.Id = c.taskId
-	res.Type = Exit
-	c.taskId++
-	return nil
+func (c *Coordinator) assignReduceTask(workerId int) *Task {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var task *Task
+	for i := 0; i < len(c.reduceTasks); i++ {
+		if c.reduceTasks[i].Status == Idle {
+			task = c.reduceTasks[i]
+			task.Index = i
+			task.Status = InProgress
+			task.WorkerId = workerId
+			return task
+		}
+	}
+	return &Task{Type: Retry, Index: -1, Status: Completed, WorkerId: workerId}
+}
+
+func (c *Coordinator) assignExitTask(workerId int) *Task {
+	return &Task{
+		Index:		-1,
+		WorkerId:	workerId,
+		File:		"",
+		Type:		Exit,
+		Status:		Completed,		
+	}
+}
+
+// check on task in [TaskTimeout] seconds and mark it idle if it's still not done
+func (c *Coordinator) monitorTaskProgress(task *Task) {
+	time.Sleep(TaskTimeout)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if task.Status != Completed {
+		log.Printf("marking task %d as idle", task.Index)
+		task.Status = Idle
+		task.WorkerId = NoWorkerAssigned
+	}
 }
