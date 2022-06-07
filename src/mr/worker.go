@@ -10,7 +10,6 @@ import (
 	"io/ioutil"
 	"encoding/json"
 	"path/filepath"
-	"sort"
 	"time"
 )
 
@@ -125,7 +124,10 @@ func doReduceTask(reducef func(string, []string) string, task *TaskResponse) err
 		log.Fatalf("failed to read dir '%s'", TempDir)
 	}
 
-	// map keys to list of all values for that key
+	// NOTE: using a hash table for grouping values for a key works for the examples
+	// in this lab, however, for data sets too large to fit in an in-memory hash table,
+	// we would have to store all key-value pairs on disk and do an external sort,
+	// as described in the MapReduce paper https://pdos.csail.mit.edu/6.824/papers/mapreduce.pdf
 	kvMap := make(map[string][]string)
 	var kv KeyValue
 	for _, filePath := range files {
@@ -144,13 +146,6 @@ func doReduceTask(reducef func(string, []string) string, task *TaskResponse) err
 			kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
 		}
 
-		// sort keys
-		keys := make([]string, 0, len(kvMap))
-		for k := range kvMap {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-
 		// Create temp file
 		tmpFilePath := fmt.Sprintf("%v/mr-out-%v-%v", TempDir, reduceId, os.Getpid())
 		tmpFile, err := os.Create(tmpFilePath)
@@ -159,8 +154,8 @@ func doReduceTask(reducef func(string, []string) string, task *TaskResponse) err
 		}
 
 		// Call reduce and write to temp file
-		for _, k := range keys {
-			v := reducef(k, kvMap[k])
+		for k, vals := range kvMap {
+			v := reducef(k, vals)
 			_, err := fmt.Fprintf(tmpFile, "%v %v\n", k, v)
 			if err != nil {
 				log.Fatalf("unable to write key/value pair %v - %v to file %s", k, v, tmpFilePath)
