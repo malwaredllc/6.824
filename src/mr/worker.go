@@ -131,7 +131,7 @@ func doReduceTask(reducef func(string, []string) string, task *TaskResponse) err
 	for _, filePath := range files {
 		file, err := os.Open(filePath)
 		if err != nil {
-			//log.Fatalf("unable to open file %s", filePath)
+			log.Fatalf("unable to open file %s", filePath)
 		}
 
 		// read json file and deserialize into key/value pairs
