@@ -11,22 +11,21 @@ import (
 	"strconv"
 )
 
-type TaskType string
-
-type TaskArgs struct {}
+type TaskArgs struct {
+	WorkerId	int
+}
 
 type TaskResponse struct {
-	Id			int
+	Index		int
 	Type 		TaskType	
-	Num			int
+	File 		string
 	NReduce		int
-	Target		string
-	done		bool
 }
 
 type DoneArgs struct {
-	Id		int
-	Type	TaskType
+	Index		int
+	Type		TaskType
+	WorkerId 	int
 }
 
 type DoneResponse struct {}

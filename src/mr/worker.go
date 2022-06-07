@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"os"
 	"log"
+	"time"
 	"errors"
 	"net/rpc"
 	"hash/fnv"
 	"io/ioutil"
 	"encoding/json"
 	"path/filepath"
-	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -37,7 +37,7 @@ func ihash(key string) int {
 
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
-	//os.MkdirAll(TempDir, os.ModePerm)
+	os.MkdirAll(TempDir, os.ModePerm)
 	for {
 		task := getTaskFromCoordinator()
 
@@ -45,36 +45,36 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 		case Map:
 			doMapTask(mapf, task)
-			notifyTaskDone(task.Id, task.Type)
+			notifyTaskDone(task.Index, task.Type)
 
 		case Reduce:
 			doReduceTask(reducef, task)
-			notifyTaskDone(task.Id, task.Type)
+			notifyTaskDone(task.Index, task.Type)
 
 		case Retry:
-			log.Printf("Retrying momentarily...")
+			//log.Printf("No task ready, retrying shortly...")
 			time.Sleep(RetryInterval)
 
 		case Exit:
-			log.Printf("Exiting")
+			//log.Printf("Exiting")
 			os.Exit(0)
 
 		default:
-			log.Printf("Invalid task type received: %s", task.Type)
+			//log.Printf("Invalid task type received: %v", task.Type)
 			os.Exit(1)
 		}
 	}
 }
 
 func getTaskFromCoordinator() *TaskResponse {
-	args := TaskArgs{}
+	args := TaskArgs{WorkerId: os.Getpid()}
 	reply := TaskResponse{}
 	ok := call("Coordinator.GetTask", &args, &reply)
 	if ok {
-		log.Printf("Id: %d, Type: %s, Target: %s, nReduce: %d, Num: %d", reply.Id, reply.Type, reply.Target, reply.NReduce, reply.Num)
+		//log.Printf("Index: %d, Type: %v, File: %s, nReduce: %d", reply.Index, reply.Type, reply.File, reply.NReduce)
 		return &reply
 	} else {
-		log.Printf("call failed - coordinator is down. exiting\n")
+		//log.Printf("call failed - coordinator is down. exiting\n")
 		os.Exit(0)
 	}
 	return nil
@@ -82,22 +82,22 @@ func getTaskFromCoordinator() *TaskResponse {
 
 func doMapTask(mapf func(string, string) []KeyValue, task *TaskResponse) error {
 	intermediate := []KeyValue{}
-	file, err := os.Open(task.Target)
+	file, err := os.Open(task.File)
 	if err != nil {
-		log.Fatalf("cannot open %v", task.Target)
+		log.Fatalf("cannot open %v", task.File)
 	}
 	content, err := ioutil.ReadAll(file)
 	if err != nil {
-		log.Fatalf("cannot read %v", task.Target)
+		log.Fatalf("cannot read %v", task.File)
 	}
 	file.Close()
-	kva := mapf(task.Target, string(content))
+	kva := mapf(task.File, string(content))
 	intermediate = append(intermediate, kva...)
 
 	// write to nReduce JSON files
 	files := make([]*json.Encoder, task.NReduce)
 	for i := 0; i < task.NReduce; i++ {
-		path := fmt.Sprintf("%s/mr-%d-%d.json", TempDir, task.Num, i)
+		path := fmt.Sprintf("%s/mr-%d-%d.json", TempDir, task.Index, i)
 		f, err := os.Create(path)
 		if err != nil {
 			log.Fatalf("error creating %v", path)
@@ -111,14 +111,14 @@ func doMapTask(mapf func(string, string) []KeyValue, task *TaskResponse) error {
 		enc := files[idx]
 		err := enc.Encode(&kv)
 		if err != nil {
-			log.Printf("failed to encode %v", kv)
+			//log.Printf("failed to encode %v", kv)
 		}
 	}
 	return nil
 }
 
 func doReduceTask(reducef func(string, []string) string, task *TaskResponse) error {
-	reduceId := task.Num
+	reduceId := task.Index
 	files, err := filepath.Glob(fmt.Sprintf("%s/mr-*-%d.json", TempDir, reduceId))
 	if err != nil {
 		log.Fatalf("failed to read dir '%s'", TempDir)
@@ -141,7 +141,7 @@ func doReduceTask(reducef func(string, []string) string, task *TaskResponse) err
 		for dec.More() {
 			err = dec.Decode(&kv)
 			if err != nil {
-				log.Printf("unable to decode json key/value pair")
+				//log.Printf("unable to decode json key/value pair")
 			}
 			kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
 		}
@@ -176,13 +176,13 @@ func doReduceTask(reducef func(string, []string) string, task *TaskResponse) err
 
 // notify coordinator task is done
 func notifyTaskDone(taskId int, taskType TaskType) error {
-	args := DoneArgs{Id: taskId, Type: taskType}
+	args := DoneArgs{Index: taskId, Type: taskType, WorkerId: os.Getpid()}
 	reply := DoneResponse{}
 	ok := call("Coordinator.TaskDone", &args, &reply)
 	if ok {
 		return nil
 	}
-	return errors.New(fmt.Sprintf("failed to send task done for %d %s", taskId, taskType))
+	return errors.New(fmt.Sprintf("failed to send task done for %v %v", taskId, taskType))
 }
 
 //
