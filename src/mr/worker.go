@@ -9,9 +9,9 @@ import (
 	"hash/fnv"
 	"io/ioutil"
 	"encoding/json"
+	"path/filepath"
 	"sort"
 	"time"
-	"regexp"
 )
 
 // Map functions return a slice of KeyValue.
@@ -38,114 +38,28 @@ func ihash(key string) int {
 
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	//os.MkdirAll(TempDir, os.ModePerm)
 	for {
 		task := getTaskFromCoordinator()
 
 		switch task.Type {
+
 		case Map:
-			intermediate := []KeyValue{}
-			file, err := os.Open(task.Target)
-			if err != nil {
-				log.Fatalf("cannot open %v", task.Target)
-			}
-			content, err := ioutil.ReadAll(file)
-			if err != nil {
-				log.Fatalf("cannot read %v", task.Target)
-			}
-			file.Close()
-			kva := mapf(task.Target, string(content))
-			intermediate = append(intermediate, kva...)
-
-			// write to nReduce JSON files
-			files := make([]*json.Encoder, task.NReduce)
-			for i := 0; i < task.NReduce; i++ {
-				path := fmt.Sprintf("%s/mr-%d-%d.json", TempDir, task.Num, i)
-				f, err := os.Create(path)
-				if err != nil {
-					log.Fatalf("error creating %v", path)
-				}
-				enc := json.NewEncoder(f)
-				files[i] = enc
-				defer f.Close()
-			}
-			for _, kv := range intermediate {
-				idx := ihash(kv.Key) % task.NReduce
-				enc := files[idx]
-				err := enc.Encode(&kv)
-				if err != nil {
-					log.Printf("failed to encode %v", kv)
-				}
-			}
-
-			// notify coordinator task is done
-			sendTaskDone(task.Id, task.Type)
+			doMapTask(mapf, task)
+			notifyTaskDone(task.Id, task.Type)
 
 		case Reduce:
-			mapFiles, err := ioutil.ReadDir(".")
-			if err != nil {
-				log.Fatalf("failed to read dir mr-tmp")
-			}
-
-			// find each map file for this reduce task ("mr-[job]-[task].json")
-			for i := 0; i < task.NReduce; i++ {
-				intermediate := []KeyValue{}
-				pattern := fmt.Sprintf("-%d.json", i)
-				for _, mapFile := range mapFiles {
-					matched, _ := regexp.MatchString(pattern, mapFile.Name())
-					if matched {
-						file, err := os.Open(fmt.Sprintf("%s", mapFile.Name()))
-						if err != nil {
-							log.Fatalf("couldn't open %s", mapFile.Name())
-						}
-						dec := json.NewDecoder(file)
-						for {
-							var kv KeyValue
-							if err := dec.Decode(&kv); err != nil {
-								break
-							}
-							intermediate = append(intermediate, kv)
-						}
-					}
-				}
-
-				// sort keys
-				sort.Sort(ByKey(intermediate))
-
-				// create output file
-				oname := fmt.Sprintf("%s/mr-out-%d", TempDir, i)
-				ofile, _ := os.Create(oname)
-			
-				// call Reduce on each distinct key in intermediate[],
-				// and print the result to mr-out-[task]
-				idx := 0
-				for idx < len(intermediate) {
-					j := idx + 1
-					for j < len(intermediate) && intermediate[j].Key == intermediate[idx].Key {
-						j++
-					}
-					values := []string{}
-					for k := idx; k < j; k++ {
-						values = append(values, intermediate[k].Value)
-					}
-					output := reducef(intermediate[idx].Key, values)
-			
-					// this is the correct format for each line of Reduce output.
-					fmt.Fprintf(ofile, "%v %v\n", intermediate[idx].Key, output)
-			
-					idx = j
-				}
-				ofile.Close()
-			}
-
-			// notify coordinator task is done
-			sendTaskDone(task.Id, task.Type)
+			doReduceTask(reducef, task)
+			notifyTaskDone(task.Id, task.Type)
 
 		case Retry:
 			log.Printf("Retrying momentarily...")
 			time.Sleep(RetryInterval)
+
 		case Exit:
 			log.Printf("Exiting")
 			os.Exit(0)
+
 		default:
 			log.Printf("Invalid task type received: %s", task.Type)
 			os.Exit(1)
@@ -154,17 +68,11 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 }
 
 func getTaskFromCoordinator() *TaskResponse {
-	// declare args structure
 	args := TaskArgs{}
-
-	// declare a reply structure.
 	reply := TaskResponse{}
-
-	// send the RPC request, wait for the reply.
 	ok := call("Coordinator.GetTask", &args, &reply)
 	if ok {
-		log.Printf("Id: %d, Type: %s, Target: %s, nReduce: %d, Num: %d", 
-			reply.Id, reply.Type, reply.Target, reply.NReduce, reply.Num)
+		log.Printf("Id: %d, Type: %s, Target: %s, nReduce: %d, Num: %d", reply.Id, reply.Type, reply.Target, reply.NReduce, reply.Num)
 		return &reply
 	} else {
 		log.Printf("call failed - coordinator is down. exiting\n")
@@ -173,8 +81,106 @@ func getTaskFromCoordinator() *TaskResponse {
 	return nil
 }
 
+func doMapTask(mapf func(string, string) []KeyValue, task *TaskResponse) error {
+	intermediate := []KeyValue{}
+	file, err := os.Open(task.Target)
+	if err != nil {
+		log.Fatalf("cannot open %v", task.Target)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", task.Target)
+	}
+	file.Close()
+	kva := mapf(task.Target, string(content))
+	intermediate = append(intermediate, kva...)
+
+	// write to nReduce JSON files
+	files := make([]*json.Encoder, task.NReduce)
+	for i := 0; i < task.NReduce; i++ {
+		path := fmt.Sprintf("%s/mr-%d-%d.json", TempDir, task.Num, i)
+		f, err := os.Create(path)
+		if err != nil {
+			log.Fatalf("error creating %v", path)
+		}
+		enc := json.NewEncoder(f)
+		files[i] = enc
+		defer f.Close()
+	}
+	for _, kv := range intermediate {
+		idx := ihash(kv.Key) % task.NReduce
+		enc := files[idx]
+		err := enc.Encode(&kv)
+		if err != nil {
+			log.Printf("failed to encode %v", kv)
+		}
+	}
+	return nil
+}
+
+func doReduceTask(reducef func(string, []string) string, task *TaskResponse) error {
+	reduceId := task.Num
+	files, err := filepath.Glob(fmt.Sprintf("%s/mr-*-%d.json", TempDir, reduceId))
+	if err != nil {
+		log.Fatalf("failed to read dir '%s'", TempDir)
+	}
+
+	// map keys to list of all values for that key
+	kvMap := make(map[string][]string)
+	var kv KeyValue
+	for _, filePath := range files {
+		file, err := os.Open(filePath)
+		if err != nil {
+			//log.Fatalf("unable to open file %s", filePath)
+		}
+
+		// read json file and deserialize into key/value pairs
+		dec := json.NewDecoder(file)
+		for dec.More() {
+			err = dec.Decode(&kv)
+			if err != nil {
+				log.Printf("unable to decode json key/value pair")
+			}
+			kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
+		}
+
+		// sort keys
+		keys := make([]string, 0, len(kvMap))
+		for k := range kvMap {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		// Create temp file
+		tmpFilePath := fmt.Sprintf("%v/mr-out-%v-%v", TempDir, reduceId, os.Getpid())
+		tmpFile, err := os.Create(tmpFilePath)
+		if err != nil {
+			log.Fatalf("unable to create file %s", tmpFilePath)
+		}
+
+		// Call reduce and write to temp file
+		for _, k := range keys {
+			v := reducef(k, kvMap[k])
+			_, err := fmt.Fprintf(tmpFile, "%v %v\n", k, v)
+			if err != nil {
+				log.Fatalf("unable to write key/value pair %v - %v to file %s", k, v, tmpFilePath)
+			}
+		}
+
+		// atomically rename temp files to ensure no one observes partial files
+		tmpFile.Close()
+		newPath := fmt.Sprintf("%s/mr-out-%v", TempDir, reduceId)
+		err = os.Rename(tmpFilePath, newPath)
+		if err != nil {
+			log.Fatalf("unable to rename %s to %s", tmpFilePath, newPath)
+		}
+	}
+
+	return nil
+}
+
 // notify coordinator task is done
-func sendTaskDone(taskId int, taskType TaskType) error {
+func notifyTaskDone(taskId int, taskType TaskType) error {
 	args := DoneArgs{Id: taskId, Type: taskType}
 	reply := DoneResponse{}
 	ok := call("Coordinator.TaskDone", &args, &reply)
@@ -194,7 +200,8 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		// coordinator is down, exit
+		os.Exit(0)
 	}
 	defer c.Close()
 

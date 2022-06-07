@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	TempDir = "tmp"
+	TempDir = "."
 	Map = "Map"
 	Reduce = "Reduce"
 	Retry = "Retry"
@@ -23,7 +23,7 @@ const (
 
 type Coordinator struct {
 	mapCh			chan string
-	reduceCh		chan int
+	redCh			chan int
 	mapTasks		map[int]*TaskResponse
 	reduceTasks		map[int]*TaskResponse
 	numFiles		int
@@ -41,7 +41,7 @@ func (c *Coordinator) GetTask(args *TaskArgs, res *TaskResponse) error {
 
 	if len(c.mapCh) > 0 {
 		c.assignMapTask(res)
-	} else if len(c.reduceCh) > 0 {
+	} else if len(c.redCh) > 0 {
 		c.assignReduceTask(res)
 	} else {
 		c.assignExitTask(res)
@@ -95,7 +95,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	n := len(files)
 	c := Coordinator{}
 	c.mapCh = make(chan string, n)
-	c.reduceCh = make(chan int, nReduce)
+	c.redCh = make(chan int, nReduce)
 	c.mapTasks = make(map[int]*TaskResponse)
 	c.reduceTasks = make(map[int]*TaskResponse)
 	c.mapRemaining = n
@@ -112,7 +112,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// create thread safe queue for reduce tasks
 	for i := 0; i < nReduce; i++ {
-		c.reduceCh <- i
+		c.redCh <- i
 	} 
 
 	log.Printf("created coordinator")
@@ -162,7 +162,7 @@ func (c *Coordinator) assignReduceTask(res *TaskResponse) error {
 	}
 
 	// otherwise assign a reduce task
-	redNum := <-c.reduceCh
+	redNum := <-c.redCh
 	res.Id = c.taskId
 	res.Type = Reduce
 	res.Target = "" 	// no target for reduce task
@@ -180,7 +180,7 @@ func (c *Coordinator) assignReduceTask(res *TaskResponse) error {
 		defer c.mu.RUnlock()
 		if !c.reduceTasks[taskId].done {
 			log.Printf("re-enqueueing task %s %d", res.Type, res.Num)
-			c.reduceCh <- res.Num // this is the reduce task number
+			c.redCh <- res.Num // this is the reduce task number
 		} else {
 			log.Printf("task %s %d confirmed done", res.Type, res.Num)
 		}
