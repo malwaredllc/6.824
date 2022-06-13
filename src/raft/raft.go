@@ -60,10 +60,19 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	// persistent state
 
+	currentTerm int 	 // currntTerm is latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor 	int		 // votedFor candidateId that received vote in current term (or null if none)
+	log			[]string // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+
+	// volatile state on all servers
+	commitIndex int 	 // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+	lastApplied int		 // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+
+	// volate state on leaders (re-initialized after election)
+	nextIndex	[]int	 // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	matchIndex	[]int	 // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 }
 
 // return currentTerm and whether this server
