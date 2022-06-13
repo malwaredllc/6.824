@@ -27,6 +27,10 @@ import (
 	"6.824/labrpc"
 )
 
+const (
+	HasNotVoted = iota
+)
+
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -153,7 +157,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+	Term			int
+	CandidateId		int
+	LastLogIndex 	int
+	LastLogTerm		int
 }
 
 //
@@ -161,14 +168,35 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	// Your data here (2A).
+	Term 			int
+	VoteGranted 	bool
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+
+	grantVote := false
+	logUpToDate := false
+
+	if rf.currentTerm <= args.Term && rf.commitIndex <= args.LastLogIndex {
+		logUpToDate = true
+	}
+
+	// If votedFor is null or candidateId, 
+	// and candidate’s log is at least as up-to-date as receiver’s log, grant vote
+	if (rf.votedFor == HasNotVoted || rf.votedFor == args.CandidateId) && logUpToDate {
+		grantVote = true
+	}
+
+	// reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		grantVote = false
+	}
+
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = grantVote
 }
 
 //
