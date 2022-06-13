@@ -18,11 +18,11 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"sync"
 	"sync/atomic"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -61,7 +61,6 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// persistent state
-
 	currentTerm int 	 // currntTerm is latest term server has seen (initialized to 0 on first boot, increases monotonically)
 	votedFor 	int		 // votedFor candidateId that received vote in current term (or null if none)
 	log			[]string // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
@@ -69,6 +68,7 @@ type Raft struct {
 	// volatile state on all servers
 	commitIndex int 	 // index of highest log entry known to be committed (initialized to 0, increases monotonically)
 	lastApplied int		 // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+	leader		int		 // index into peers[] that is the current term's leader
 
 	// volate state on leaders (re-initialized after election)
 	nextIndex	[]int	 // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
@@ -81,7 +81,8 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
-	// Your code here (2A).
+	term = rf.currentTerm
+	isleader = (rf.me == rf.leader)
 	return term, isleader
 }
 
@@ -91,14 +92,13 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
