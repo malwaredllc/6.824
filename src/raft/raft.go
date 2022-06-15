@@ -28,8 +28,18 @@ import (
 )
 
 const (
-	HasNotVoted = iota
+	HasNotVoted = -1
+	NoLeader = -1
 )
+
+// states
+const (
+	Follower = iota
+	Candidate
+	Leader
+)
+
+type RaftServerState int
 
 
 //
@@ -67,7 +77,7 @@ type Raft struct {
 
 	// persistent state
 	currentTerm int 	 // currntTerm is latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	votedFor 	int		 // votedFor candidateId that received vote in current term (or null if none)
+	votedFor 	int		 // votedFor candidateId that received vote in current term (or -1 if none)
 	log			[]string // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
 
 	// volatile state on all servers
@@ -78,6 +88,9 @@ type Raft struct {
 	// volate state on leaders (re-initialized after election)
 	nextIndex	[]int	 // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchIndex	[]int	 // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+
+	state		RaftServerState
+	voteCount	int	
 }
 
 // return currentTerm and whether this server
@@ -311,8 +324,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.state = Follower
+	rf.voteCount = 0
 
-	// initialize from state persisted before a crash
+	// persisted state which will be overwritten from persisted state on disk if it exists
+	rf.votedFor = HasNotVoted
+	rf.currentTerm = 0
+	rf.log = []string{}
+
+	// volatile state on all servers
+	rf.commitIndex = 0 	// index of highest log entry known to be committed (initialized to 0, increases monotonically)
+	rf.lastApplied = 0 	// index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+	rf.leader = NoLeader	// index into peers[] that is the current term's leader
+
+	// volate state on leaders (re-initialized after election)
+	rf.nextIndex = []int{}  		// for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	rf.matchIndex = []int{}	 	// for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+
+	// initialize from state persisted before a crash (currentTerm, votedFor, log)
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
