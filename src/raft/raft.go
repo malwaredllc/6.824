@@ -288,7 +288,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		// if we granted a vote, send it on channel to runServer thread to act on
-		rf.grantVoteCh <- true
+		rf.sendToChannel(rf.grantVoteCh, true)
 	}
 }
 
@@ -365,10 +365,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 	if reply.VoteGranted {
 		rf.voteCount++
-		Debug(dInfo, "S%d has received %d votes", rf.voteCount)
+		Debug(dInfo, "S%d has received %d votes", rf.me, rf.voteCount)
 		// if we reached a majority, send msg to winner channel for runServer thread to see
 		if rf.voteCount == len(rf.peers)/2 +1 {
-			rf.winnerCh <- true
+			rf.sendToChannel(rf.winnerCh, true)
 		}
 	}
 }
@@ -465,7 +465,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) runServer() {
-	Debug(dInfo, "S%d running server", rf.me)
 	for !rf.killed() {
 		rf.mu.Lock()
 		state := rf.state
@@ -475,22 +474,19 @@ func (rf *Raft) runServer() {
 		
 		// while we are leader, broadcast AppendEntries until term is over
 		case Leader: 
-			Debug(dInfo, "S%d case: leader", rf.me)
 			select {
 			case <-rf.stepDownCh: // already follower by the time this msg is received
 				Debug(dInfo, "S%d leader: stepdown chan", rf.me)
 			case <-time.After(120 * time.Millisecond):
-				Debug(dInfo, "S%d leader: broadcasting AppendEntries", rf.me)
 				rf.broadcastAppendEntries()
 			}
 
 		case Follower:
-			Debug(dInfo, "S%d case: follower", rf.me)
 			select {
 			case <-rf.grantVoteCh: // if we granted a vote, stay follower
-				Debug(dInfo, "S%d follower: grantVoteCh", rf.me)
+				//Debug(dInfo, "S%d follower: grantVoteCh", rf.me)
 			case <-rf.heartbeatCh: // if we received heartbeat from leader, stay follower
-				Debug(dInfo, "S%d follower: heartbeatCh", rf.me)
+				//Debug(dInfo, "S%d follower: heartbeatCh", rf.me)
 			// if after random election timeout between 360-500ms no vote granted and no heartbeat, run election
 			case <-time.After(rf.getElectionTimeout() * time.Millisecond):
 				Debug(dInfo, "S%d follower: running election", rf.me)
@@ -498,7 +494,6 @@ func (rf *Raft) runServer() {
 			}
 
 		case Candidate:
-			Debug(dInfo, "S%d case: candidate", rf.me)
 			select {
 			case <-rf.stepDownCh: // should be a follower by the time this msg is received
 				Debug(dInfo, "S%d candidate: stepDownCh", rf.me)
@@ -527,7 +522,7 @@ func (rf *Raft) convertToFollower(newTerm int) {
 	rf.votedFor = HasNotVoted
 	// if prev state wasn't follower, send msg on stepdown chan for runServer thread to act on
 	if prevState != Follower {
-		rf.stepDownCh <- true
+		rf.sendToChannel(rf.stepDownCh, true)
 	}
 }
 
@@ -546,6 +541,7 @@ func (rf *Raft) convertToCandidate(fromState State) {
 
 	rf.broadcastVoteRequest()
 }
+
 
 func (rf *Raft) convertToLeader() {
 	rf.mu.Lock()
@@ -618,7 +614,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// append entries serves as a heartbeat mechanism from leader to followers
-	rf.heartbeatCh <- true
+	rf.sendToChannel(rf.heartbeatCh, true)
 	lastIndex := rf.getLastIndex()
 
 	// reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
@@ -644,6 +640,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = true
 
+	// update leader id if successful
+	rf.leader = args.LeaderId
+	
 	// update commit index if necessary to min(leaderCommit, lastIndex)
 	if args.LeaderCommit > rf.commitIndex {
 		lastIndex = rf.getLastIndex()
@@ -655,15 +654,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// if commit index has changed, apply newly committed log commands
 		go rf.applyLogs()
 	}
-
-
-	// update leader id
-	rf.leader = args.LeaderId
 }
 
 // send AppendEntries RPC to a specific follower node
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	Debug(dInfo, "S%d sending append entries to S%d", rf.me, server)
+//	Debug(dInfo, "S%d sending append entries to S%d", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
 		return
@@ -674,7 +669,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 // send AppendEntries RPC to all followers in parallel
 func (rf *Raft) broadcastAppendEntries() {
-	Debug(dInfo, "S%d called broadcast append entries", rf.me)
 	if rf.state != Leader {
 		return
 	}
@@ -718,4 +712,13 @@ func (rf *Raft) resetChannels() {
 	rf.stepDownCh = make(chan bool)
 	rf.grantVoteCh = make(chan bool)
 	rf.heartbeatCh = make(chan bool)
+}
+
+func (rf *Raft) sendToChannel(channel chan<- bool, msg bool) {
+	select {
+    case channel <- msg:
+        // message sent
+    default:
+        // message dropped
+	}
 }
