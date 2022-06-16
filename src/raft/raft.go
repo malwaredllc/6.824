@@ -22,6 +22,8 @@ import (
 	"bytes"
 	"sync"
 	"sync/atomic"
+	"math/rand"
+	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
@@ -39,7 +41,12 @@ const (
 	Leader
 )
 
-type RaftServerState int
+// misc
+const (
+	ElectionTimeout = 500
+)
+
+type State int
 
 
 //
@@ -65,6 +72,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	Term	int
+	Command	interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -76,9 +88,9 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// persistent state
-	currentTerm int 	 // currntTerm is latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	votedFor 	int		 // votedFor candidateId that received vote in current term (or -1 if none)
-	log			[]string // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+	currentTerm int 		// currntTerm is latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor 	int		 	// votedFor candidateId that received vote in current term (or -1 if none)
+	log			[]LogEntry 	// log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
 
 	// volatile state on all servers
 	commitIndex int 	 // index of highest log entry known to be committed (initialized to 0, increases monotonically)
@@ -89,8 +101,14 @@ type Raft struct {
 	nextIndex	[]int	 // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchIndex	[]int	 // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 
-	state		RaftServerState
-	voteCount	int	
+	// misc
+	state		State	
+	voteCount	int
+	applyCh		chan ApplyMsg
+	grantVoteCh	chan bool
+	winnerCh	chan bool
+	heartbeatCh chan bool
+	stepDownCh	chan bool
 }
 
 // return currentTerm and whether this server
@@ -131,7 +149,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
-	var persistedLog []string
+	var persistedLog []LogEntry
 	if d.Decode(&currentTerm) != nil ||
 	   d.Decode(&votedFor) != nil ||
 	   d.Decode(&persistedLog) != nil {
@@ -189,27 +207,50 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
 
-	grantVote := false
-	logUpToDate := false
+	// reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
 
-	if rf.currentTerm <= args.Term && rf.commitIndex <= args.LastLogIndex {
-		logUpToDate = true
+	// step down to follower if incoming args term is greater than our current term
+	if args.Term > rf.currentTerm {
+		rf.stepDownToFollower(args.Term)
 	}
 
 	// If votedFor is null or candidateId, 
 	// and candidate’s log is at least as up-to-date as receiver’s log, grant vote
-	if (rf.votedFor == HasNotVoted || rf.votedFor == args.CandidateId) && logUpToDate {
-		grantVote = true
+	if (rf.votedFor == HasNotVoted || rf.votedFor == args.CandidateId) &&
+		rf.isLogUpToDate(args.LastLogTerm, args.LastLogIndex) {
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		// if we granted a vote, send it on channel to runServer thread to act on
+		rf.grantVoteCh <- true
+	}
+}
+
+func (rf *Raft) getLastIndex() int {
+	return len(rf.log) - 1
+}
+
+func (rf *Raft) getLastTerm() int {
+	return rf.log[rf.getLastIndex()].Term
+}
+
+func (rf *Raft) isLogUpToDate(candidateLastTerm int, candidateLastIndex int) bool {
+	lastTerm, lastIndex := rf.getLastTerm(), rf.getLastIndex()
+	// if candidate term is same as our term, check if candidate log index is >= our index
+	if candidateLastTerm == lastTerm {
+		return candidateLastIndex >= lastIndex
 	}
 
-	// reply false if term < currentTerm
-	if args.Term < rf.currentTerm {
-		grantVote = false
-	}
-
-	reply.Term = rf.currentTerm
-	reply.VoteGranted = grantVote
+	// otherwise return true if candidate term is greater than ours, otherwise false
+	return candidateLastTerm > lastTerm
 }
 
 //
@@ -241,9 +282,36 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+
+	// if call failed, return (no vote)
+	if !ok {
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// if this node isn't a candidate or if the target node's term is less than our term,
+	if rf.state != Candidate || reply.Term < rf.currentTerm {
+		return
+	}
+
+	// if target node term is higher than ours, become a follower
+	if reply.Term > rf.currentTerm {
+		rf.stepDownToFollower(reply.Term)
+		rf.persist()
+		return
+	}
+
+	if reply.VoteGranted {
+		rf.voteCount++
+		// if we reached a majority, send msg to winner channel for runServer thread to see
+		if rf.voteCount == len(rf.peers)/2 +1 {
+			rf.winnerCh <- true
+		}
+	}
 }
 
 
@@ -293,18 +361,6 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-// The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
-
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
-
-	}
-}
-
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -330,23 +386,43 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// persisted state which will be overwritten from persisted state on disk if it exists
 	rf.votedFor = HasNotVoted
 	rf.currentTerm = 0
-	rf.log = []string{}
 
 	// volatile state on all servers
 	rf.commitIndex = 0 	// index of highest log entry known to be committed (initialized to 0, increases monotonically)
 	rf.lastApplied = 0 	// index of highest log entry applied to state machine (initialized to 0, increases monotonically)
 	rf.leader = NoLeader	// index into peers[] that is the current term's leader
-
-	// volate state on leaders (re-initialized after election)
-	rf.nextIndex = []int{}  		// for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
-	rf.matchIndex = []int{}	 	// for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
-
+	rf.applyCh = make(chan ApplyMsg)
+	rf.grantVoteCh = make(chan bool)
+	rf.stepDownCh = make(chan bool)
+	rf.winnerCh = make(chan bool)
+	rf.nextIndex = make([]int, len(peers)) // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	rf.matchIndex = make([]int, len(peers)) // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+	
 	// initialize from state persisted before a crash (currentTerm, votedFor, log)
 	rf.readPersist(persister.ReadRaftState())
 
-	// start ticker goroutine to start elections
-	go rf.ticker()
-
-
+	// run server in separate thread 
+	go rf.runServer()
 	return rf
+}
+
+func (rf *Raft) runServer() {
+
+}
+
+// get a random election timeout between 360 and 500 ms
+func (rf *Raft) getElectionTimeout() time.Duration {
+	return time.Duration(360 + rand.Intn(240))
+}
+
+// step down to follower state
+func (rf *Raft) stepDownToFollower(newTerm int) {
+	prevState := rf.state
+	rf.state = Follower
+	rf.currentTerm = newTerm
+	rf.votedFor = HasNotVoted
+	// if prev state wasn't follower, send msg on stepdown chan for runServer thread to act on
+	if prevState != Follower {
+		rf.stepDownCh <- true
+	}
 }
