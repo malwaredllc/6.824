@@ -175,7 +175,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	term = rf.currentTerm
-	isleader = (rf.me == rf.leader)
+	isleader = rf.state == Leader
 	return term, isleader
 }
 
@@ -284,6 +284,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// and candidate’s log is at least as up-to-date as receiver’s log, grant vote
 	if (rf.votedFor == HasNotVoted || rf.votedFor == args.CandidateId) &&
 		rf.isLogUpToDate(args.LastLogTerm, args.LastLogIndex) {
+		Debug(dInfo, "S%d voting for S%d", rf.me, args.CandidateId)
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		// if we granted a vote, send it on channel to runServer thread to act on
@@ -340,6 +341,10 @@ func (rf *Raft) isLogUpToDate(candidateLastTerm int, candidateLastIndex int) boo
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	if rf.state != Candidate {
+		return
+	}
+
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
 	// if call failed, return (no vote)
@@ -350,11 +355,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// if this node isn't a candidate or if the target node's term is less than our term,
-	if rf.state != Candidate || reply.Term < rf.currentTerm {
-		return
-	}
-
+	Debug(dInfo, "S%d term %d vote reply from S%d: votegranted: %b, term: %d", rf.me, rf.currentTerm, server, reply.VoteGranted, reply.Term)
 	// if target node term is higher than ours, become a follower
 	if reply.Term > rf.currentTerm {
 		rf.convertToFollower(reply.Term)
@@ -364,6 +365,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 	if reply.VoteGranted {
 		rf.voteCount++
+		Debug(dInfo, "S%d has received %d votes", rf.voteCount)
 		// if we reached a majority, send msg to winner channel for runServer thread to see
 		if rf.voteCount == len(rf.peers)/2 +1 {
 			rf.winnerCh <- true
@@ -447,7 +449,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// volatile state on all servers
 	rf.commitIndex = 0 	// index of highest log entry known to be committed (initialized to 0, increases monotonically)
 	rf.lastApplied = 0 	// index of highest log entry applied to state machine (initialized to 0, increases monotonically)
-	rf.leader = NoLeader	// index into peers[] that is the current term's leader
 	rf.applyCh = make(chan ApplyMsg)
 	rf.grantVoteCh = make(chan bool)
 	rf.stepDownCh = make(chan bool)
@@ -479,6 +480,7 @@ func (rf *Raft) runServer() {
 			case <-rf.stepDownCh: // already follower by the time this msg is received
 				Debug(dInfo, "S%d leader: stepdown chan", rf.me)
 			case <-time.After(120 * time.Millisecond):
+				Debug(dInfo, "S%d leader: broadcasting AppendEntries", rf.me)
 				rf.broadcastAppendEntries()
 			}
 
@@ -534,6 +536,7 @@ func (rf *Raft) convertToCandidate(fromState State) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	Debug(dInfo, "converted S%d to candidate", rf.me)
 	rf.resetChannels()
 	rf.currentTerm++
 	rf.state = Candidate
@@ -549,6 +552,7 @@ func (rf *Raft) convertToLeader() {
 	defer rf.mu.Unlock()
 
 	rf.resetChannels()
+	rf.state = Leader
 	
 	// matchIndex: for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 	rf.matchIndex = make([]int, len(rf.peers))
@@ -560,7 +564,8 @@ func (rf *Raft) convertToLeader() {
 	for i := range rf.peers {
 		rf.nextIndex[i] = lastIndex
 	}
-
+	// send out append entries / heartbeat
+	rf.broadcastAppendEntries()
 }
 
 // runs sendVoteRequest to all peers in parallel
@@ -572,8 +577,10 @@ func (rf *Raft) broadcastVoteRequest() {
 		LastLogTerm: 	rf.getLastTerm(),
 	}
 
-	for i := 0; i < len(rf.peers); i++ {
-		go rf.sendRequestVote(i, args, &RequestVoteReply{})
+	for server := range rf.peers {
+		if server != rf.me {
+			go rf.sendRequestVote(server, args, &RequestVoteReply{})
+		}
 	}
 }
 
@@ -649,21 +656,45 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		go rf.applyLogs()
 	}
 
+
+	// update leader id
+	rf.leader = args.LeaderId
 }
 
 // send AppendEntries RPC to a specific follower node
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	Debug(dInfo, "S%d sending append entries to S%d", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
 		return
 	}
 
-	
+	// TODO
 }
 
 // send AppendEntries RPC to all followers in parallel
 func (rf *Raft) broadcastAppendEntries() {
+	Debug(dInfo, "S%d called broadcast append entries", rf.me)
+	if rf.state != Leader {
+		return
+	}
 
+	for server := range rf.peers {
+		if server != rf.me {
+			args := AppendEntriesArgs{}
+			args.Term = rf.currentTerm
+			args.LeaderId = rf.me
+			args.LeaderCommit = rf.commitIndex
+			args.PrevLogIndex = rf.nextIndex[server]-1
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+
+			// copy new log entries into args
+			entries := rf.log[args.PrevLogIndex:]
+			args.Entries = make([]LogEntry, len(entries))
+			copy(args.Entries, entries)
+			go rf.sendAppendEntries(server, &args, &AppendEntriesReply{})
+		}
+	}
 }
 
 // apply the committed log commands
