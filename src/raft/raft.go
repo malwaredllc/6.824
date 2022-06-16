@@ -18,12 +18,15 @@ package raft
 //
 
 import (
+	"os"
+	"fmt"
 	"log"
 	"bytes"
 	"sync"
 	"sync/atomic"
 	"math/rand"
 	"time"
+	"strconv"
 
 	"6.824/labgob"
 	"6.824/labrpc"
@@ -48,6 +51,60 @@ const (
 
 type State int
 
+
+// Retrieve the verbosity level from an environment variable
+func getVerbosity() int {
+	v := os.Getenv("VERBOSE")
+	level := 0
+	if v != "" {
+		var err error
+		level, err = strconv.Atoi(v)
+		if err != nil {
+			log.Fatalf("Invalid verbosity %v", v)
+		}
+	}
+	return level
+}
+
+type logTopic string
+const (
+	dClient  logTopic = "CLNT"
+	dCommit  logTopic = "CMIT"
+	dDrop    logTopic = "DROP"
+	dError   logTopic = "ERRO"
+	dInfo    logTopic = "INFO"
+	dLeader  logTopic = "LEAD"
+	dLog     logTopic = "LOG1"
+	dLog2    logTopic = "LOG2"
+	dPersist logTopic = "PERS"
+	dSnap    logTopic = "SNAP"
+	dTerm    logTopic = "TERM"
+	dTest    logTopic = "TEST"
+	dTimer   logTopic = "TIMR"
+	dTrace   logTopic = "TRCE"
+	dVote    logTopic = "VOTE"
+	dWarn    logTopic = "WARN"
+)
+
+var debugStart time.Time
+var debugVerbosity int
+
+func init() {
+	debugVerbosity = getVerbosity()
+	debugStart = time.Now()
+
+	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
+}
+
+func Debug(topic logTopic, format string, a ...interface{}) {
+	if debugVerbosity >= 1 {
+		time := time.Since(debugStart).Microseconds()
+		time /= 100
+		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
+		format = prefix + format
+		log.Printf(format, a...)
+	}
+}
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -153,7 +210,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if d.Decode(&currentTerm) != nil ||
 	   d.Decode(&votedFor) != nil ||
 	   d.Decode(&persistedLog) != nil {
-		log.Printf("readPersist failed")
+		Debug(dInfo, "readPersist failed")
 	} else {
 	  rf.currentTerm = currentTerm
 	  rf.votedFor = votedFor
@@ -220,7 +277,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// step down to follower if incoming args term is greater than our current term
 	if args.Term > rf.currentTerm {
-		rf.stepDownToFollower(args.Term)
+		rf.convertToFollower(args.Term)
 	}
 
 	// If votedFor is null or candidateId, 
@@ -300,7 +357,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 	// if target node term is higher than ours, become a follower
 	if reply.Term > rf.currentTerm {
-		rf.stepDownToFollower(reply.Term)
+		rf.convertToFollower(reply.Term)
 		rf.persist()
 		return
 	}
@@ -395,9 +452,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.grantVoteCh = make(chan bool)
 	rf.stepDownCh = make(chan bool)
 	rf.winnerCh = make(chan bool)
-	rf.nextIndex = make([]int, len(peers)) // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
-	rf.matchIndex = make([]int, len(peers)) // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
-	
+	rf.log = append(rf.log, LogEntry{Term: 0}) // initialize with empty log entry to prevent out of bounds errors
+	// NOTE: rf.nextIndex and rf.matchIndex are only needed when node is a leader, and need to be re-initialized upon election
+
 	// initialize from state persisted before a crash (currentTerm, votedFor, log)
 	rf.readPersist(persister.ReadRaftState())
 
@@ -407,7 +464,50 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) runServer() {
+	Debug(dInfo, "S%d running server", rf.me)
+	for !rf.killed() {
+		rf.mu.Lock()
+		state := rf.state
+		rf.mu.Unlock()
 
+		switch state {
+		
+		// while we are leader, broadcast AppendEntries until term is over
+		case Leader: 
+			Debug(dInfo, "S%d case: leader", rf.me)
+			select {
+			case <-rf.stepDownCh: // already follower by the time this msg is received
+				Debug(dInfo, "S%d leader: stepdown chan", rf.me)
+			}
+
+		case Follower:
+			Debug(dInfo, "S%d case: follower", rf.me)
+			select {
+			case <-rf.grantVoteCh: // if we granted a vote, stay follower
+				Debug(dInfo, "S%d follower: grantVoteCh", rf.me)
+			case <-rf.heartbeatCh: // if we received heartbeat from leader, stay follower
+				Debug(dInfo, "S%d follower: heartbeatCh", rf.me)
+			// if after random election timeout between 360-500ms no vote granted and no heartbeat, run election
+			case <-time.After(rf.getElectionTimeout() * time.Millisecond):
+				Debug(dInfo, "S%d follower: running election", rf.me)
+				rf.convertToCandidate(Follower)
+			}
+
+		case Candidate:
+			Debug(dInfo, "S%d case: candidate", rf.me)
+			select {
+			case <-rf.stepDownCh: // should be a follower by the time this msg is received
+				Debug(dInfo, "S%d candidate: stepDownCh", rf.me)
+			case <-rf.winnerCh:
+				Debug(dInfo, "S%d candidate: winnerCh", rf.me)
+				rf.convertToLeader()
+			// rerun election if after random election timeout between 360-500ms no winner is found
+			case <-time.After(rf.getElectionTimeout() * time.Millisecond):
+				Debug(dInfo, "S%d candidate: running election again", rf.me)
+				rf.convertToCandidate(Candidate)
+			}
+		}
+	}
 }
 
 // get a random election timeout between 360 and 500 ms
@@ -416,7 +516,7 @@ func (rf *Raft) getElectionTimeout() time.Duration {
 }
 
 // step down to follower state
-func (rf *Raft) stepDownToFollower(newTerm int) {
+func (rf *Raft) convertToFollower(newTerm int) {
 	prevState := rf.state
 	rf.state = Follower
 	rf.currentTerm = newTerm
@@ -425,4 +525,60 @@ func (rf *Raft) stepDownToFollower(newTerm int) {
 	if prevState != Follower {
 		rf.stepDownCh <- true
 	}
+}
+
+// increment term and run election as a candidate
+func (rf *Raft) convertToCandidate(fromState State) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.resetChannels()
+	rf.currentTerm++
+	rf.state = Candidate
+	rf.votedFor = rf.me
+	rf.voteCount = 1
+	rf.persist()
+
+	rf.broadcastVoteRequest()
+}
+
+func (rf *Raft) convertToLeader() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.resetChannels()
+	
+	// matchIndex: for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+	rf.matchIndex = make([]int, len(rf.peers))
+	
+	// rf.nextIndex: for each server, index of the next log entry to send to that server 
+	// (initialized to leader last log index + 1)
+	rf.nextIndex = make([]int, len(rf.peers)) 
+	lastIndex := rf.getLastIndex() + 1
+	for i := range rf.peers {
+		rf.nextIndex[i] = lastIndex
+	}
+
+}
+
+// runs sendVoteRequest to all peers in parallel
+func (rf *Raft) broadcastVoteRequest() {
+	args := &RequestVoteArgs{
+		Term: 			rf.currentTerm,
+		CandidateId: 	rf.me,	
+		LastLogIndex: 	rf.getLastIndex(),
+		LastLogTerm: 	rf.getLastTerm(),
+	}
+
+	for i := 0; i < len(rf.peers); i++ {
+		go rf.sendRequestVote(i, args, &RequestVoteReply{})
+	}
+}
+
+// helper method for resetting all channels, used when follower becomes candidate for new term+election
+func (rf *Raft) resetChannels() {
+	rf.winnerCh = make(chan bool)
+	rf.stepDownCh = make(chan bool)
+	rf.grantVoteCh = make(chan bool)
+	rf.heartbeatCh = make(chan bool)
 }
