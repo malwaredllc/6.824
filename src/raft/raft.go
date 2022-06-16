@@ -478,6 +478,8 @@ func (rf *Raft) runServer() {
 			select {
 			case <-rf.stepDownCh: // already follower by the time this msg is received
 				Debug(dInfo, "S%d leader: stepdown chan", rf.me)
+			case <-time.After(120 * time.Millisecond):
+				rf.broadcastAppendEntries()
 			}
 
 		case Follower:
@@ -572,6 +574,110 @@ func (rf *Raft) broadcastVoteRequest() {
 
 	for i := 0; i < len(rf.peers); i++ {
 		go rf.sendRequestVote(i, args, &RequestVoteReply{})
+	}
+}
+
+type AppendEntriesArgs struct {
+	Term 			int	
+	LeaderId		int
+	PrevLogIndex 	int
+	PrevLogTerm		int
+	Entries			[]LogEntry
+	LeaderCommit 	int
+}
+
+type AppendEntriesReply struct {
+	Term		int
+	Success		bool	
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
+
+	// set default return values
+	reply.Term = rf.currentTerm
+	reply.Success = false
+
+	// reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	// convert to follower if incoming term is greater than ours
+	if args.Term > rf.currentTerm {
+		rf.convertToFollower(args.Term)
+	}
+
+	// append entries serves as a heartbeat mechanism from leader to followers
+	rf.heartbeatCh <- true
+	lastIndex := rf.getLastIndex()
+
+	// reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+	if args.PrevLogIndex > lastIndex {
+		return
+	}
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		return
+	}
+
+	// find point where any conflicting entries occur
+	i, j := args.PrevLogIndex + 1, 0
+	for ; i < lastIndex && j < len(args.Entries); i, j = i+1, j+1 {
+		if rf.log[i].Term != args.Entries[j].Term {
+			return
+		}
+	}
+
+	// append new entries (potentially overwriting existing conflicting entries)
+	rf.log = rf.log[:i]
+	args.Entries = args.Entries[j:]
+	rf.log = append(rf.log, args.Entries...)
+
+	reply.Success = true
+
+	// update commit index if necessary to min(leaderCommit, lastIndex)
+	if args.LeaderCommit > rf.commitIndex {
+		lastIndex = rf.getLastIndex()
+		if args.LeaderCommit < lastIndex {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = lastIndex
+		}
+		// if commit index has changed, apply newly committed log commands
+		go rf.applyLogs()
+	}
+
+}
+
+// send AppendEntries RPC to a specific follower node
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if !ok {
+		return
+	}
+
+	
+}
+
+// send AppendEntries RPC to all followers in parallel
+func (rf *Raft) broadcastAppendEntries() {
+
+}
+
+// apply the committed log commands
+func (rf *Raft) applyLogs() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for i := rf.lastApplied; i < rf.commitIndex; i++ {
+		rf.applyCh <- ApplyMsg{
+			Command: rf.log[i].Command,
+			CommandIndex: i,
+			CommandValid: true,
+		}
+		rf.lastApplied = i
 	}
 }
 
