@@ -369,6 +369,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		// if we reached a majority, send msg to winner channel for runServer thread to see
 		if rf.voteCount == len(rf.peers)/2 +1 {
 			rf.sendToChannel(rf.winnerCh, true)
+			// send heartbeat immediately after winning
+			Debug(dInfo, "S%d won election, sending heartbeat", rf.me)
+			rf.broadcastAppendEntries()
 		}
 	}
 }
@@ -389,14 +392,20 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	term := rf.currentTerm
+	isLeader := rf.state == Leader
+	if !isLeader {
+		return -1, term, isLeader
+	}
+	rf.log = append(rf.log, LogEntry{term, command})
+	rf.persist()
 
-	return index, term, isLeader
+	lastIndex := rf.getLastIndex()
+	return lastIndex, term, isLeader
 }
 
 //
@@ -484,9 +493,9 @@ func (rf *Raft) runServer() {
 		case Follower:
 			select {
 			case <-rf.grantVoteCh: // if we granted a vote, stay follower
-				//Debug(dInfo, "S%d follower: grantVoteCh", rf.me)
+				Debug(dInfo, "S%d follower: grantVoteCh", rf.me)
 			case <-rf.heartbeatCh: // if we received heartbeat from leader, stay follower
-				//Debug(dInfo, "S%d follower: heartbeatCh", rf.me)
+				Debug(dInfo, "S%d follower: heartbeatCh", rf.me)
 			// if after random election timeout between 360-500ms no vote granted and no heartbeat, run election
 			case <-time.After(rf.getElectionTimeout() * time.Millisecond):
 				Debug(dInfo, "S%d follower: running election", rf.me)
@@ -511,7 +520,7 @@ func (rf *Raft) runServer() {
 
 // get a random election timeout between 360 and 500 ms
 func (rf *Raft) getElectionTimeout() time.Duration {
-	return time.Duration(360 + rand.Intn(240))
+	return time.Duration(1000 + rand.Intn(240))
 }
 
 // step down to follower state
@@ -605,6 +614,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
+		Debug(dInfo, "S%d received invalid term in heartbeat", rf.me)
 		return
 	}
 
@@ -614,6 +624,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// append entries serves as a heartbeat mechanism from leader to followers
+	Debug(dInfo, "S%d sending heartbeat channel", rf.me)
 	rf.sendToChannel(rf.heartbeatCh, true)
 	lastIndex := rf.getLastIndex()
 
@@ -658,9 +669,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 // send AppendEntries RPC to a specific follower node
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-//	Debug(dInfo, "S%d sending append entries to S%d", rf.me, server)
+	Debug(dInfo, "S%d sending append entries to S%d", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
+		Debug(dInfo, "S%d error sending append entires to S%D", rf.me, server)
 		return
 	}
 
@@ -714,6 +726,7 @@ func (rf *Raft) resetChannels() {
 	rf.heartbeatCh = make(chan bool)
 }
 
+// send message on specified channel in non-blocking manner
 func (rf *Raft) sendToChannel(channel chan<- bool, msg bool) {
 	select {
     case channel <- msg:
