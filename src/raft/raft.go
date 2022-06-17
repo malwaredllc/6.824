@@ -393,16 +393,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	term := rf.currentTerm
-	isLeader := rf.state == Leader
-	if !isLeader {
-		return -1, term, isLeader
+	if rf.state != Leader {
+		return -1, rf.currentTerm, false
 	}
+	term := rf.currentTerm
 	rf.log = append(rf.log, LogEntry{term, command})
 	rf.persist()
 
 	lastIndex := rf.getLastIndex()
-	return lastIndex, term, isLeader
+	return lastIndex, term, true
 }
 
 //
@@ -455,7 +454,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// volatile state on all servers
 	rf.commitIndex = 0 	// index of highest log entry known to be committed (initialized to 0, increases monotonically)
 	rf.lastApplied = 0 	// index of highest log entry applied to state machine (initialized to 0, increases monotonically)
-	rf.applyCh = make(chan ApplyMsg)
+	rf.applyCh = applyCh
 	rf.grantVoteCh = make(chan bool)
 	rf.stepDownCh = make(chan bool)
 	rf.winnerCh = make(chan bool)
@@ -679,6 +678,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.commitIndex = lastIndex
 		}
+		Debug(dInfo, "S%d set commitIndex=%d", rf.me, rf.commitIndex)
 		// if commit index has changed, apply newly committed log commands
 		go rf.applyLogs()
 	}
@@ -751,8 +751,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				}
 			}
 		}
-		if replicatedCount >= (len(rf.peers)/2)+1 {
+		if replicatedCount > len(rf.peers) / 2 {
 			rf.commitIndex = n
+			Debug(dInfo, "S%d majority of servers agreed commitIndex=%d", rf.me, n)
 			go rf.applyLogs()
 			break
 		}
@@ -789,13 +790,15 @@ func (rf *Raft) applyLogs() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	for i := rf.lastApplied; i < rf.commitIndex; i++ {
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		Debug(dInfo, "S%d applying cmd %d", rf.me, i)
 		rf.applyCh <- ApplyMsg{
 			Command: rf.log[i].Command,
 			CommandIndex: i,
 			CommandValid: true,
 		}
 		rf.lastApplied = i
+		Debug(dInfo, "S%d applied cmd %d successfully", rf.me, i)
 	}
 }
 
