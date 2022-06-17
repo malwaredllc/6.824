@@ -369,9 +369,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		// if we reached a majority, send msg to winner channel for runServer thread to see
 		if rf.voteCount == len(rf.peers)/2 +1 {
 			rf.sendToChannel(rf.winnerCh, true)
-			// send heartbeat immediately after winning
-			Debug(dInfo, "S%d won election, sending heartbeat", rf.me)
-			rf.broadcastAppendEntries()
 		}
 	}
 }
@@ -569,6 +566,8 @@ func (rf *Raft) convertToLeader() {
 	for i := range rf.peers {
 		rf.nextIndex[i] = lastIndex
 	}
+
+	Debug(dInfo, "S%d nextIndex = %v", rf.me, rf.nextIndex)
 	// send out append entries / heartbeat
 	rf.broadcastAppendEntries()
 }
@@ -601,6 +600,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term		int
 	Success		bool	
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -608,9 +609,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	defer rf.persist()
 
+	Debug(dInfo, "S%d received AppendEntries args %+v", rf.me, args)
+	Debug(dInfo, "S%d state: %+v", rf.me, rf)
+
 	// set default return values
 	reply.Term = rf.currentTerm
 	reply.Success = false
+	reply.ConflictTerm  = -1
+	reply.ConflictIndex = -1
 
 	// reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
@@ -624,23 +630,34 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// append entries serves as a heartbeat mechanism from leader to followers
-	Debug(dInfo, "S%d sending heartbeat channel", rf.me)
 	rf.sendToChannel(rf.heartbeatCh, true)
 	lastIndex := rf.getLastIndex()
 
-	// reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+	// reply false if follower (receiving this rpc) log is shorter than leader (who sent this rpc)
 	if args.PrevLogIndex > lastIndex {
-		return
-	}
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// last index is the last consistent entry so conflict will begin at lastIndex+1
+		reply.ConflictIndex = lastIndex + 1
+		Debug(dInfo, "S%d received args.PrevLogIndex > lastIndex, returning %v", rf.me, reply)
 		return
 	}
 
-	// find point where any conflicting entries occur
+	// conflicting term check
+	if myPrevLogTerm := rf.log[args.PrevLogIndex].Term; myPrevLogTerm != args.PrevLogTerm {
+		reply.ConflictTerm = myPrevLogTerm
+		// loop backward through logs to find first entry with conflicting term
+		for i := args.PrevLogTerm; i >= 0 && rf.log[i].Term == myPrevLogTerm; i-- {
+			reply.ConflictIndex = i
+		}
+		reply.Success = false
+		Debug(dInfo, "S%d received conflicting prevTerm, returning %v", rf.me, reply)
+		return
+	}
+
+	// this will truncate follower's log if a new entry conflicts with an existing one
 	i, j := args.PrevLogIndex + 1, 0
 	for ; i < lastIndex && j < len(args.Entries); i, j = i+1, j+1 {
 		if rf.log[i].Term != args.Entries[j].Term {
-			return
+			break
 		}
 	}
 
@@ -669,14 +686,77 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 // send AppendEntries RPC to a specific follower node
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	Debug(dInfo, "S%d sending append entries to S%d", rf.me, server)
+	Debug(dInfo, "S%d sending AppendEntries to S%d with args %+v", rf.me, server, args)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
 		Debug(dInfo, "S%d error sending append entires to S%D", rf.me, server)
 		return
 	}
 
-	// TODO
+	if rf.state != Leader || args.Term != rf.currentTerm || reply.Term < rf.currentTerm {
+		return
+	}
+
+	// check if other server has a higher term than this one, if so become follower
+	if reply.Term > rf.currentTerm {
+		rf.convertToFollower(reply.Term)
+	}
+
+	Debug(dInfo, "S%d sendAppendEntries received reply %+v", rf.me, reply)
+
+	// update match index (last index known to be replicated) if call was successful
+	if reply.Success {
+		nextIndex := args.PrevLogIndex + len(args.Entries)
+		if nextIndex > rf.matchIndex[server] {
+			rf.matchIndex[server] = nextIndex
+		}
+		// update next index to be replicate as matchIndex+1
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
+
+	// check if follower's log is shorter than leader's log
+	} else if reply.ConflictTerm < 0 {
+		// if so, update next index to start sending append entries from
+		rf.nextIndex[server] = reply.ConflictIndex
+		rf.matchIndex[server] = reply.ConflictIndex - 1
+
+	// otherwise find the conflict term in the log by looping backward through it
+	} else {
+		newNextIndex := rf.getLastIndex();
+		for ; newNextIndex >= 0; newNextIndex-- {
+			if rf.log[newNextIndex].Term == reply.ConflictTerm {
+				break
+			}
+		}
+
+		// if not found, set newNextIndex to conflict index
+		if newNextIndex < 0 {
+			rf.nextIndex[server] = reply.ConflictIndex
+		} else {
+			rf.nextIndex[server] = newNextIndex
+		}
+		rf.matchIndex[server] = rf.nextIndex[server] - 1
+	}
+
+	// update commit index if necessary
+	// i.e. if there exists an N such that N > commitIndex, a majority of
+	// matchIndex[i] >= N, and log[N].term == currentTerm, set commitIndex = N.
+	// Loop backwards to find most recent commit index more quickly and break out of the loop asap.
+	for n := rf.getLastIndex(); n >= rf.commitIndex; n-- {
+		replicatedCount := 1
+		if rf.log[n].Term == rf.currentTerm {
+			// check if this entry has been replicated to a majority of peers
+			for i := 0; i < len(rf.peers); i++ {
+				if i != rf.me && rf.matchIndex[i] >= n {
+					replicatedCount++
+				}
+			}
+		}
+		if replicatedCount >= (len(rf.peers)/2)+1 {
+			rf.commitIndex = n
+			go rf.applyLogs()
+			break
+		}
+	}
 }
 
 // send AppendEntries RPC to all followers in parallel
@@ -695,9 +775,10 @@ func (rf *Raft) broadcastAppendEntries() {
 			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 
 			// copy new log entries into args
-			entries := rf.log[args.PrevLogIndex:]
+			entries := rf.log[rf.nextIndex[server]:]
 			args.Entries = make([]LogEntry, len(entries))
 			copy(args.Entries, entries)
+			
 			go rf.sendAppendEntries(server, &args, &AppendEntriesReply{})
 		}
 	}
